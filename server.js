@@ -27,6 +27,8 @@ const inbox = new Map();
 const usernames = new Map(); // lower -> record
 /** peerId -> lower username */
 const peerUser = new Map();
+/** peerId -> room while WebSocket is connected */
+const peerLive = new Map();
 
 function now() { return Date.now(); }
 function purgeExpired() {
@@ -125,7 +127,13 @@ const server = http.createServer(async (req, res) => {
         if (!USER_RE.test(name)) return json(res, 400, { error: 'invalid', message: 'That username does not look right.' });
         const rec = usernames.get(name.toLowerCase());
         if (!rec) return json(res, 404, { error: 'not_found', message: 'No phone uses that username yet. Ask them to open the app so it can register.' });
-        return json(res, 200, { username: rec.username, peerId: rec.peerId, room: rec.room || null });
+        // Prefer the room the peer is actually connected to right now (avoids stale shared-room claims).
+        const live = peerLive.get(String(rec.peerId));
+        const roomOut = live || rec.room || null;
+        return json(res, 200, {
+          username: rec.username, peerId: rec.peerId, room: roomOut,
+          live: !!live, registeredRoom: rec.room || null,
+        });
       }
 
       // --- missed call ---
@@ -209,6 +217,7 @@ server.on('upgrade', (req, socket, head) => {
   const url = new URL(req.url, 'http://x');
   const room = url.searchParams.get('room') || '';
   const token = req.headers['x-app-token'] || url.searchParams.get('token') || '';
+  const peer = (url.searchParams.get('peer') || '').trim();
   const ip = (req.headers['x-forwarded-for'] || req.socket.remoteAddress || '').split(',')[0].trim();
   const reject = (code, msg) => { socket.write(`HTTP/1.1 ${code} ${msg}\r\n\r\n`); socket.destroy(); };
   if (url.pathname !== '/ws') return reject(404, 'Not Found');
@@ -217,13 +226,15 @@ server.on('upgrade', (req, socket, head) => {
   if ((perIp.get(ip) || 0) >= MAX_CONN_PER_IP) return reject(429, 'Too Many');
   const set = rooms.get(room);
   if (set && set.size >= MAX_PER_ROOM) return reject(429, 'Room Full');
-  wss.handleUpgrade(req, socket, head, ws => join(ws, room, ip));
+  wss.handleUpgrade(req, socket, head, ws => join(ws, room, ip, peer));
 });
 
-function join(ws, room, ip) {
+function join(ws, room, ip, peer) {
   perIp.set(ip, (perIp.get(ip) || 0) + 1);
   if (!rooms.has(room)) rooms.set(room, new Set());
   rooms.get(room).add(ws);
+  ws.peerId = peer || '';
+  if (ws.peerId) peerLive.set(ws.peerId, room);
   let win = Date.now(), msgs = 0, bytes = 0;
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
@@ -240,6 +251,7 @@ function join(ws, room, ip) {
   ws.on('close', () => {
     const s = rooms.get(room); if (s) { s.delete(ws); if (!s.size) rooms.delete(room); }
     const n = (perIp.get(ip) || 1) - 1; if (n <= 0) perIp.delete(ip); else perIp.set(ip, n);
+    if (ws.peerId && peerLive.get(ws.peerId) === room) peerLive.delete(ws.peerId);
   });
   ws.on('error', () => {});
 }
@@ -251,4 +263,4 @@ setInterval(() => {
 server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
 
 // Exported for unit-ish tests when required
-module.exports = { USER_RE, ROOM_RE, TTL_MS, purgeExpired, inbox, usernames, peerUser };
+module.exports = { USER_RE, ROOM_RE, TTL_MS, purgeExpired, inbox, usernames, peerUser, peerLive };
