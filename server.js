@@ -44,12 +44,9 @@ function isBlockedBy(recipientId, senderId) {
 /** Peek Proto `from` (bytes 4..11 big-endian uint64) from a live frame. */
 function peekFrom(buf) {
   if (!buf || buf.length < 12) return '';
-  // Node Buffer: read BigInt then stringify — peer ids fit in JS number range we use as strings
+  // Proto stores Java signed long (int64 BE). Match Engine.myId().toString() (may be negative).
   try {
-    const hi = buf.readUInt32BE(4);
-    const lo = buf.readUInt32BE(8);
-    // unsigned 64 as decimal string without BigInt dependency issues
-    const n = BigInt(hi) * 4294967296n + BigInt(lo);
+    const n = buf.readBigInt64BE(4);
     return n.toString();
   } catch (_) { return ''; }
 }
@@ -145,6 +142,13 @@ const server = http.createServer(async (req, res) => {
         if (!rec) return json(res, 404, { error: 'none' });
         rec.room = room; rec.updatedAt = now();
         return json(res, 200, { ok: true, username: rec.username, room });
+      }
+      // --- live presence (peer currently has a WS) ---
+      if (req.method === 'GET' && path === '/v1/live') {
+        const peer = String(url.searchParams.get('peer') || '').trim();
+        if (!peer) return json(res, 400, { error: 'invalid', message: 'Missing peer.' });
+        const room = peerLive.get(peer) || null;
+        return json(res, 200, { ok: true, peer, live: !!room, room });
       }
       if (req.method === 'GET' && path.startsWith('/v1/username/')) {
         const name = decodeURIComponent(path.slice('/v1/username/'.length)).trim();
