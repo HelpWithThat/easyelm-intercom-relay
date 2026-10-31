@@ -124,7 +124,7 @@ const server = http.createServer(async (req, res) => {
         const name = decodeURIComponent(path.slice('/v1/username/'.length)).trim();
         if (!USER_RE.test(name)) return json(res, 400, { error: 'invalid', message: 'That username does not look right.' });
         const rec = usernames.get(name.toLowerCase());
-        if (!rec) return json(res, 404, { error: 'not_found', message: 'No phone uses that username yet.' });
+        if (!rec) return json(res, 404, { error: 'not_found', message: 'No phone uses that username yet. Ask them to open the app so it can register.' });
         return json(res, 200, { username: rec.username, peerId: rec.peerId, room: rec.room || null });
       }
 
