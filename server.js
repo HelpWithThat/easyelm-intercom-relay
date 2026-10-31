@@ -29,6 +29,30 @@ const usernames = new Map(); // lower -> record
 const peerUser = new Map();
 /** peerId -> room while WebSocket is connected */
 const peerLive = new Map();
+/** peerId (string) -> Set of blocked peerIds (string). Silent; blocked party is never told. */
+const blocks = new Map();
+function setBlocks(peerId, list) {
+  const s = new Set((list || []).map(String).filter(Boolean));
+  if (!s.size) blocks.delete(String(peerId));
+  else blocks.set(String(peerId), s);
+  return [...(blocks.get(String(peerId)) || [])];
+}
+function isBlockedBy(recipientId, senderId) {
+  const s = blocks.get(String(recipientId));
+  return !!(s && s.has(String(senderId)));
+}
+/** Peek Proto `from` (bytes 4..11 big-endian uint64) from a live frame. */
+function peekFrom(buf) {
+  if (!buf || buf.length < 12) return '';
+  // Node Buffer: read BigInt then stringify — peer ids fit in JS number range we use as strings
+  try {
+    const hi = buf.readUInt32BE(4);
+    const lo = buf.readUInt32BE(8);
+    // unsigned 64 as decimal string without BigInt dependency issues
+    const n = BigInt(hi) * 4294967296n + BigInt(lo);
+    return n.toString();
+  } catch (_) { return ''; }
+}
 
 function now() { return Date.now(); }
 function purgeExpired() {
@@ -144,6 +168,7 @@ const server = http.createServer(async (req, res) => {
         const toId = String(body.toId || '');
         const fromName = String(body.fromName || 'Someone').slice(0, 40);
         if (!ROOM_RE.test(room) || !fromId || !toId) return json(res, 400, { error: 'invalid' });
+        if (isBlockedBy(toId, fromId)) return json(res, 200, { ok: true, id: null, dropped: 'blocked' });
         const id = crypto.randomBytes(8).toString('hex');
         const item = {
           id, type: 'missed', room, fromId, toId, fromName,
@@ -166,6 +191,7 @@ const server = http.createServer(async (req, res) => {
         const transcript = body.transcript != null ? String(body.transcript).slice(0, 2000) : null;
         if (!ROOM_RE.test(room) || !fromId || !toId) return json(res, 400, { error: 'invalid' });
         if (!audioB64 || audioB64.length > MAX_VOICE_B64) return json(res, 400, { error: 'audio', message: 'Voice message too large or empty.' });
+        if (isBlockedBy(toId, fromId)) return json(res, 200, { ok: true, id: null, dropped: 'blocked' });
         const id = crypto.randomBytes(8).toString('hex');
         const item = {
           id, type: 'voice', room, fromId, toId, fromName,
@@ -199,6 +225,20 @@ const server = http.createServer(async (req, res) => {
         const keep = list.filter(m => !idset.has(m.id));
         if (!keep.length) inbox.delete(k); else inbox.set(k, keep);
         return json(res, 200, { ok: true, removed: list.length - keep.length });
+      }
+
+      if (req.method === 'POST' && path === '/v1/blocks') {
+        const body = await readJson(req);
+        const peerId = String(body.peerId || '');
+        const list = Array.isArray(body.blocked) ? body.blocked : [];
+        if (!peerId) return json(res, 400, { error: 'invalid' });
+        const saved = setBlocks(peerId, list);
+        return json(res, 200, { ok: true, blocked: saved });
+      }
+      if (req.method === 'GET' && path === '/v1/blocks') {
+        const peerId = url.searchParams.get('peer') || '';
+        if (!peerId) return json(res, 400, { error: 'invalid' });
+        return json(res, 200, { blocked: [...(blocks.get(String(peerId)) || [])] });
       }
 
       return json(res, 404, { error: 'not_found' });
@@ -244,8 +284,11 @@ function join(ws, room, ip, peer) {
     msgs++; bytes += data.length;
     if (msgs > MAX_MSGS_PER_SEC || bytes > MAX_BYTES_PER_SEC) return;
     if (!isBinary) { if (String(data) === 'ping') ws.send('pong'); return; }
+    const fromId = peekFrom(Buffer.isBuffer(data) ? data : Buffer.from(data));
     for (const peer of rooms.get(room) || []) {
-      if (peer !== ws && peer.readyState === 1 && peer.bufferedAmount < 256000) peer.send(data, { binary: true });
+      if (peer === ws || peer.readyState !== 1 || peer.bufferedAmount >= 256000) continue;
+      if (fromId && peer.peerId && isBlockedBy(peer.peerId, fromId)) continue; // silent drop
+      peer.send(data, { binary: true });
     }
   });
   ws.on('close', () => {
@@ -263,4 +306,4 @@ setInterval(() => {
 server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
 
 // Exported for unit-ish tests when required
-module.exports = { USER_RE, ROOM_RE, TTL_MS, purgeExpired, inbox, usernames, peerUser, peerLive };
+module.exports = { USER_RE, ROOM_RE, TTL_MS, purgeExpired, inbox, usernames, peerUser, peerLive, blocks, setBlocks, isBlockedBy, peekFrom };
