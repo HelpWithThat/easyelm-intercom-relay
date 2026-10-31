@@ -90,8 +90,8 @@ async function main() {
   const muncherId = '900002';
   const joeRoom = '230904';   // JustOne23's code
   const muncherRoom = '481027'; // Muncher's real room
-  const joeUser = 'JustOne23';
-  const muncherUser = 'Muncher';
+  const joeUser = 'JustOne23_e2e';
+  const muncherUser = 'Muncher_e2e';
 
   console.log('1) Claim usernames with DISTINCT rooms');
   let r = await req2('POST', '/v1/username/claim', { username: joeUser, peerId: joeId, room: joeRoom });
