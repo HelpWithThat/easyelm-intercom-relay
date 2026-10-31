@@ -1,5 +1,4 @@
-// Verify /v1/live + reconnect: peer shows live while WS open, not after close;
-// second client in same room still receives frames after reconnect.
+// Verify /v1/live + reconnect.
 // RELAY=https://host APP_TOKEN=... node test-live-presence.js
 const WebSocket = require('ws');
 const baseHttp = (process.env.RELAY || 'http://localhost:10000').replace(/\/$/, '')
@@ -9,15 +8,14 @@ const token = process.env.APP_TOKEN;
 if (!token) { console.error('APP_TOKEN required'); process.exit(1); }
 
 const room = String(100000 + Math.floor(Math.random() * 899999));
-const joeId = '-424242424242';
-const uncleId = '9876543210';
+const joeId = String(-(400000000000 + Math.floor(Math.random() * 1e8)));
+const uncleId = String(9000000000 + Math.floor(Math.random() * 1e8));
 
 async function live(peer) {
   const r = await fetch(`${baseHttp}/v1/live?peer=${encodeURIComponent(peer)}`, {
     headers: { 'x-app-token': token },
   });
-  const j = await r.json();
-  return j;
+  return r.json();
 }
 
 function open(peer) {
@@ -27,6 +25,16 @@ function open(peer) {
     w.on('open', () => ok(w));
     w.on('error', bad);
     w.on('unexpected-response', (q, res) => bad(new Error('HTTP ' + res.statusCode)));
+  });
+}
+
+function closed(w) {
+  return new Promise((ok) => {
+    if (w.readyState === WebSocket.CLOSED) return ok();
+    w.once('close', () => ok());
+    try { w.send('leave'); } catch (_) {}
+    try { w.close(1000, 'bye'); } catch (_) {}
+    setTimeout(() => { try { w.terminate(); } catch (_) {} ok(); }, 2000);
   });
 }
 
@@ -46,25 +54,26 @@ function frameFrom(fromIdStr) {
   let a = await live(uncleId);
   if (!a.live || a.room !== room) throw new Error('uncle should be live in room: ' + JSON.stringify(a));
 
-  // Joe receives uncle audio (simulates hearing)
   let joeGot = false;
   joe.on('message', () => { joeGot = true; });
   uncle.send(frameFrom(uncleId));
   await new Promise(r => setTimeout(r, 400));
   if (!joeGot) throw new Error('joe did not hear uncle');
 
-  // Reconnect uncle (drop + re-open) — presence must recover
-  uncle.close();
-  await new Promise(r => setTimeout(r, 300));
-  let b = await live(uncleId);
-  if (b.live) throw new Error('uncle should be offline after close');
+  await closed(uncle);
+  let b = null;
+  for (let i = 0; i < 30; i++) {
+    b = await live(uncleId);
+    if (!b.live) break;
+    await new Promise(r => setTimeout(r, 100));
+  }
+  if (b.live) throw new Error('uncle should be offline after close: ' + JSON.stringify(b));
 
   uncle = await open(uncleId);
   await new Promise(r => setTimeout(r, 200));
   let c = await live(uncleId);
   if (!c.live) throw new Error('uncle should be live after reconnect');
 
-  // After reconnect, Joe talk reaches uncle
   let uncleGot = false;
   uncle.on('message', (d) => {
     const buf = Buffer.from(d);
@@ -74,11 +83,10 @@ function frameFrom(fromIdStr) {
   await new Promise(r => setTimeout(r, 500));
   if (!uncleGot) throw new Error('uncle did not get joe audio after reconnect');
 
-  // Old client style (no peer=) still works; /v1/live for them is false (no peer id) — OK
   const old = await open('');
-  old.close();
-
-  joe.close(); uncle.close();
-  console.log('test-live-presence: ok', { room });
+  await closed(old);
+  await closed(joe);
+  await closed(uncle);
+  console.log('test-live-presence: ok', { room, joeId, uncleId });
   process.exit(0);
 })().catch(e => { console.error(e); process.exit(1); });

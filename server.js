@@ -282,12 +282,21 @@ function join(ws, room, ip, peer) {
   let win = Date.now(), msgs = 0, bytes = 0;
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
+  function clearPresence() {
+    if (ws.peerId && peerLive.get(ws.peerId) === room) peerLive.delete(ws.peerId);
+  }
   ws.on('message', (data, isBinary) => {
     const t = Date.now();
     if (t - win >= 1000) { win = t; msgs = 0; bytes = 0; }
     msgs++; bytes += data.length;
     if (msgs > MAX_MSGS_PER_SEC || bytes > MAX_BYTES_PER_SEC) return;
-    if (!isBinary) { if (String(data) === 'ping') ws.send('pong'); return; }
+    if (!isBinary) {
+      const s = String(data);
+      if (s === 'ping') { ws.send('pong'); return; }
+      // Explicit leave: Render/proxy often delays TCP close, so presence would stick for 25s+.
+      if (s === 'leave') { clearPresence(); try { ws.close(1000, 'leave'); } catch (_) {} return; }
+      return;
+    }
     const fromId = peekFrom(Buffer.isBuffer(data) ? data : Buffer.from(data));
     for (const peer of rooms.get(room) || []) {
       if (peer === ws || peer.readyState !== 1 || peer.bufferedAmount >= 256000) continue;
@@ -298,14 +307,14 @@ function join(ws, room, ip, peer) {
   ws.on('close', () => {
     const s = rooms.get(room); if (s) { s.delete(ws); if (!s.size) rooms.delete(room); }
     const n = (perIp.get(ip) || 1) - 1; if (n <= 0) perIp.delete(ip); else perIp.set(ip, n);
-    if (ws.peerId && peerLive.get(ws.peerId) === room) peerLive.delete(ws.peerId);
+    clearPresence();
   });
-  ws.on('error', () => {});
+  ws.on('error', () => { clearPresence(); });
 }
 
 setInterval(() => {
   for (const ws of wss.clients) { if (!ws.isAlive) { ws.terminate(); continue; } ws.isAlive = false; ws.ping(); }
-}, 25000);
+}, 10000);
 
 server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
 
