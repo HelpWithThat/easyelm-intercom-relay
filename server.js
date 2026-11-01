@@ -29,6 +29,8 @@ const usernames = new Map(); // lower -> record
 const peerUser = new Map();
 /** peerId -> room while WebSocket is connected */
 const peerLive = new Map();
+/** room -> Map(peerId -> lastSeenMs) for undelivered targeting after abrupt leave */
+const roomRecent = new Map();
 /** Personal invite codes (permanent per phone) → current room. Separate from live WS room join. */
 const codes = new Map(); // code -> {code, peerId, room, updatedAt}
 const peerCode = new Map(); // peerId -> code
@@ -52,6 +54,40 @@ function peekFrom(buf) {
     const n = buf.readBigInt64BE(4);
     return n.toString();
   } catch (_) { return ''; }
+}
+/** Proto type byte at offset 3: HELLO=1 AUDIO=2 END=3 LINK=4 */
+function peekType(buf) {
+  if (!buf || buf.length < 4) return 0;
+  return buf[3];
+}
+/** Undelivered live AUDIO buffers: fromId -> { room, fromName?, chunks: Buffer[], bytes, updatedAt } */
+const undelivered = new Map();
+const MAX_UNDELIV_BYTES = 600_000;
+function appendUndelivered(room, fromId, packet) {
+  if (!fromId) return;
+  let e = undelivered.get(fromId);
+  if (!e) { e = { room, chunks: [], bytes: 0, updatedAt: Date.now() }; undelivered.set(fromId, e); }
+  e.room = room || e.room;
+  e.updatedAt = Date.now();
+  if (e.bytes + packet.length + 4 > MAX_UNDELIV_BYTES) return;
+  const len = Buffer.alloc(4); len.writeUInt32BE(packet.length, 0);
+  e.chunks.push(len, packet);
+  e.bytes += packet.length + 4;
+}
+function flushUndelivered(fromId, fromName) {
+  const e = undelivered.get(fromId);
+  undelivered.delete(fromId);
+  if (!e || !e.chunks.length) return null;
+  const blob = Buffer.concat(e.chunks);
+  if (blob.length < 64) return null;
+  const id = crypto.randomBytes(8).toString('hex');
+  const item = {
+    id, type: 'voice', room: e.room || '', fromId: String(fromId), toId: '', fromName: fromName || 'someone',
+    audioB64: blob.toString('base64'), mime: 'application/x-holo-sealed',
+    durationMs: Math.max(400, Math.round(e.bytes / 35)),
+    transcript: '(saved while offline)', createdAt: Date.now(),
+  };
+  return { room: e.room, item };
 }
 
 function now() { return Date.now(); }
@@ -368,7 +404,11 @@ function join(ws, room, ip, peer) {
   if (!rooms.has(room)) rooms.set(room, new Set());
   rooms.get(room).add(ws);
   ws.peerId = peer || '';
-  if (ws.peerId) peerLive.set(ws.peerId, room);
+  if (ws.peerId) {
+    peerLive.set(ws.peerId, room);
+    let rr = roomRecent.get(room); if (!rr) { rr = new Map(); roomRecent.set(room, rr); }
+    rr.set(ws.peerId, Date.now());
+  }
   let win = Date.now(), msgs = 0, bytes = 0;
   ws.isAlive = true;
   ws.on('pong', () => { ws.isAlive = true; });
@@ -387,11 +427,47 @@ function join(ws, room, ip, peer) {
       if (s === 'leave') { clearPresence(); try { ws.close(1000, 'leave'); } catch (_) {} return; }
       return;
     }
-    const fromId = peekFrom(Buffer.isBuffer(data) ? data : Buffer.from(data));
+    const buf = Buffer.isBuffer(data) ? data : Buffer.from(data);
+    const fromId = peekFrom(buf);
+    const typ = peekType(buf);
+    let delivered = 0;
     for (const peer of rooms.get(room) || []) {
       if (peer === ws || peer.readyState !== 1 || peer.bufferedAmount >= 256000) continue;
       if (fromId && peer.peerId && isBlockedBy(peer.peerId, fromId)) continue; // silent drop
       peer.send(data, { binary: true });
+      delivered++;
+    }
+    // Server-side fallback: live AUDIO with nobody listening → buffer; END → inbox voice
+    // (dual-index pushInbox). Recipient decrypts application/x-holo-sealed on poll.
+    if (typ === 2 && delivered === 0 && fromId) {
+      appendUndelivered(room, fromId, buf);
+    } else if (typ === 3 && fromId) {
+      const flushed = flushUndelivered(fromId, '');
+      if (flushed && flushed.item) {
+        const targets = new Set();
+        for (const peer of rooms.get(room) || []) {
+          if (peer !== ws && peer.peerId && peer.peerId !== fromId) targets.add(String(peer.peerId));
+        }
+        for (const [pid, r] of peerLive) {
+          if (r === room && pid !== fromId) targets.add(String(pid));
+        }
+        const recent = roomRecent.get(room);
+        if (recent) {
+          const cutoff = Date.now() - 5 * 60 * 1000;
+          for (const [pid, seen] of recent) {
+            if (pid !== fromId && seen >= cutoff) targets.add(String(pid));
+          }
+        }
+        for (const tid of targets) {
+          const copy = Object.assign({}, flushed.item, {
+            id: crypto.randomBytes(8).toString('hex'),
+            toId: String(tid),
+          });
+          pushInbox(room, tid, copy);
+        }
+      }
+    } else if (typ === 2 && delivered > 0 && fromId) {
+      undelivered.delete(fromId); // someone heard them — discard buffer
     }
   });
   ws.on('close', () => {
@@ -409,4 +485,4 @@ setInterval(() => {
 server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
 
 // Exported for unit-ish tests when required
-module.exports = { USER_RE, ROOM_RE, TTL_MS, purgeExpired, inbox, usernames, peerUser, peerLive, codes, peerCode, blocks, setBlocks, isBlockedBy, peekFrom, inboxKey, peerInboxKey, pushInbox, collectInbox, ackInbox };
+module.exports = { USER_RE, ROOM_RE, TTL_MS, purgeExpired, inbox, usernames, peerUser, peerLive, roomRecent, codes, peerCode, blocks, setBlocks, isBlockedBy, peekFrom, peekType, inboxKey, peerInboxKey, pushInbox, collectInbox, ackInbox, appendUndelivered, flushUndelivered, undelivered };
