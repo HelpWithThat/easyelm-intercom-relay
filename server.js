@@ -29,6 +29,9 @@ const usernames = new Map(); // lower -> record
 const peerUser = new Map();
 /** peerId -> room while WebSocket is connected */
 const peerLive = new Map();
+/** Personal invite codes (permanent per phone) → current room. Separate from live WS room join. */
+const codes = new Map(); // code -> {code, peerId, room, updatedAt}
+const peerCode = new Map(); // peerId -> code
 /** peerId (string) -> Set of blocked peerIds (string). Silent; blocked party is never told. */
 const blocks = new Map();
 function setBlocks(peerId, list) {
@@ -160,6 +163,51 @@ const server = http.createServer(async (req, res) => {
         const roomOut = live || rec.room || null;
         return json(res, 200, {
           username: rec.username, peerId: rec.peerId, room: roomOut,
+          live: !!live, registeredRoom: rec.room || null,
+        });
+      }
+
+      // --- personal invite codes (permanent; room pointer follows live shared room) ---
+      if (req.method === 'POST' && path === '/v1/code/claim') {
+        const body = await readJson(req);
+        const code = String(body.code || '').trim();
+        const peerId = String(body.peerId || '');
+        const room = String(body.room || '');
+        if (!ROOM_RE.test(code)) return json(res, 400, { error: 'invalid', message: 'Bad code.' });
+        if (!peerId) return json(res, 400, { error: 'invalid', message: 'Missing peer id.' });
+        if (room && !ROOM_RE.test(room)) return json(res, 400, { error: 'invalid', message: 'Bad room.' });
+        const existing = codes.get(code);
+        if (existing && existing.peerId !== peerId) {
+          return json(res, 409, { error: 'taken', message: 'That code is already in use.' });
+        }
+        const prev = peerCode.get(peerId);
+        if (prev && prev !== code) codes.delete(prev);
+        const rec = { code, peerId, room: room || (existing && existing.room) || '', updatedAt: now() };
+        codes.set(code, rec);
+        peerCode.set(peerId, code);
+        return json(res, 200, { ok: true, code: rec.code, room: rec.room });
+      }
+      if (req.method === 'POST' && path === '/v1/code/update-room') {
+        const body = await readJson(req);
+        const peerId = String(body.peerId || '');
+        const room = String(body.room || '');
+        if (!peerId || !ROOM_RE.test(room)) return json(res, 400, { error: 'invalid' });
+        const key = peerCode.get(peerId);
+        if (!key) return json(res, 404, { error: 'none', message: 'No code claimed yet.' });
+        const rec = codes.get(key);
+        if (!rec) return json(res, 404, { error: 'none' });
+        rec.room = room; rec.updatedAt = now();
+        return json(res, 200, { ok: true, code: rec.code, room });
+      }
+      if (req.method === 'GET' && path.startsWith('/v1/code/')) {
+        const code = decodeURIComponent(path.slice('/v1/code/'.length)).trim();
+        if (!ROOM_RE.test(code)) return json(res, 400, { error: 'invalid', message: 'That code does not look right.' });
+        const rec = codes.get(code);
+        if (!rec) return json(res, 404, { error: 'not_found', message: 'No phone uses that code yet. Ask them to open the app.' });
+        const live = peerLive.get(String(rec.peerId));
+        const roomOut = live || rec.room || null;
+        return json(res, 200, {
+          code: rec.code, peerId: rec.peerId, room: roomOut,
           live: !!live, registeredRoom: rec.room || null,
         });
       }
@@ -319,4 +367,4 @@ setInterval(() => {
 server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
 
 // Exported for unit-ish tests when required
-module.exports = { USER_RE, ROOM_RE, TTL_MS, purgeExpired, inbox, usernames, peerUser, peerLive, blocks, setBlocks, isBlockedBy, peekFrom };
+module.exports = { USER_RE, ROOM_RE, TTL_MS, purgeExpired, inbox, usernames, peerUser, peerLive, codes, peerCode, blocks, setBlocks, isBlockedBy, peekFrom };
