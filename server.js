@@ -91,13 +91,54 @@ function json(res, code, obj) {
   res.end(b);
 }
 function inboxKey(room, toId) { return `${room}:${toId}`; }
+/** Peer-primary key (0.12+). Survives room/personal-code changes after link. */
+function peerInboxKey(toId) { return `peer:${toId}`; }
 function pushInbox(room, toId, item) {
-  const k = inboxKey(room, String(toId));
-  const list = inbox.get(k) || [];
-  list.push(item);
-  while (list.length > MAX_INBOX_PER_PEER) list.shift();
-  inbox.set(k, list);
+  const tid = String(toId);
+  // Dual-index: peer-primary for 0.12+ pollers + legacy room:peer for older clients.
+  const keys = [peerInboxKey(tid)];
+  if (room && ROOM_RE.test(room)) keys.push(inboxKey(room, tid));
+  for (const k of keys) {
+    const list = inbox.get(k) || [];
+    // Avoid duplicating the same item object twice in one list if keys collide (they don't).
+    list.push(item);
+    while (list.length > MAX_INBOX_PER_PEER) list.shift();
+    inbox.set(k, list);
+  }
   return item;
+}
+function collectInbox(room, peer) {
+  const byId = new Map();
+  const peerList = inbox.get(peerInboxKey(peer)) || [];
+  for (const m of peerList) byId.set(m.id, m);
+  if (room && ROOM_RE.test(room)) {
+    for (const m of (inbox.get(inboxKey(room, peer)) || [])) byId.set(m.id, m);
+  }
+  // Also sweep any legacy room:* keys for this peer (room drifted).
+  for (const [k, list] of inbox) {
+    if (k === peerInboxKey(peer)) continue;
+    if (k.endsWith(':' + peer) || k.endsWith(':' + String(peer))) {
+      for (const m of list) byId.set(m.id, m);
+    }
+  }
+  return [...byId.values()].sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
+}
+function ackInbox(room, peer, ids) {
+  const idset = new Set(ids);
+  let removed = 0;
+  const keys = new Set([peerInboxKey(peer)]);
+  if (room && ROOM_RE.test(room)) keys.add(inboxKey(room, peer));
+  for (const [k] of inbox) {
+    if (k.endsWith(':' + peer) || k === peerInboxKey(peer)) keys.add(k);
+  }
+  for (const k of keys) {
+    const list = inbox.get(k) || [];
+    if (!list.length) continue;
+    const keep = list.filter(m => !idset.has(m.id));
+    removed += list.length - keep.length;
+    if (!keep.length) inbox.delete(k); else inbox.set(k, keep);
+  }
+  return removed;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -255,12 +296,16 @@ const server = http.createServer(async (req, res) => {
       }
 
       // --- fetch inbox ---
+      // room still accepted (old clients); items are returned for the peer across rooms.
       if (req.method === 'GET' && path === '/v1/inbox') {
         const room = url.searchParams.get('room') || '';
         const peer = url.searchParams.get('peer') || '';
-        if (!ROOM_RE.test(room) || !peer) return json(res, 400, { error: 'invalid' });
+        if (!peer) return json(res, 400, { error: 'invalid' });
+        // Old clients always send room; require it only when not using peer-primary path —
+        // accept peer-only OR room+peer (room may be stale personal/shared code).
+        if (room && !ROOM_RE.test(room)) return json(res, 400, { error: 'invalid' });
         purgeExpired();
-        const list = (inbox.get(inboxKey(room, peer)) || []).slice();
+        const list = collectInbox(room, peer);
         return json(res, 200, { items: list });
       }
 
@@ -270,13 +315,10 @@ const server = http.createServer(async (req, res) => {
         const room = String(body.room || '');
         const peer = String(body.peer || body.toId || '');
         const ids = Array.isArray(body.ids) ? body.ids.map(String) : [];
-        if (!ROOM_RE.test(room) || !peer) return json(res, 400, { error: 'invalid' });
-        const k = inboxKey(room, peer);
-        const list = inbox.get(k) || [];
-        const idset = new Set(ids);
-        const keep = list.filter(m => !idset.has(m.id));
-        if (!keep.length) inbox.delete(k); else inbox.set(k, keep);
-        return json(res, 200, { ok: true, removed: list.length - keep.length });
+        if (!peer) return json(res, 400, { error: 'invalid' });
+        if (room && !ROOM_RE.test(room)) return json(res, 400, { error: 'invalid' });
+        const removed = ackInbox(room, peer, ids);
+        return json(res, 200, { ok: true, removed });
       }
 
       if (req.method === 'POST' && path === '/v1/blocks') {
@@ -367,4 +409,4 @@ setInterval(() => {
 server.listen(PORT, () => console.log(`relay listening on ${PORT}`));
 
 // Exported for unit-ish tests when required
-module.exports = { USER_RE, ROOM_RE, TTL_MS, purgeExpired, inbox, usernames, peerUser, peerLive, codes, peerCode, blocks, setBlocks, isBlockedBy, peekFrom };
+module.exports = { USER_RE, ROOM_RE, TTL_MS, purgeExpired, inbox, usernames, peerUser, peerLive, codes, peerCode, blocks, setBlocks, isBlockedBy, peekFrom, inboxKey, peerInboxKey, pushInbox, collectInbox, ackInbox };
